@@ -1,5 +1,26 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
+<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}table{border-collapse:collapse;width:100%}td,th{border:1px solid #d7dce5;padding:6px 8px;text-align:left;vertical-align:top}.tag{padding:2px 8px;border-radius:10px;font-size:13px}.pending{background:#fef3c7;color:#92400e}.executed{background:#d1fae5;color:#065f46}.blocked{color:#b91c1c}</style>
 <h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
 <section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<section><h2>隐私处置单</h2>
+<p>患者匿名化申请不再整案删除：登记后列出同患者案例、未完成报告与待发监管动作；存在未提交报告时申请保持<b>待处理</b>并展示阻塞原因，报告结清后执行。执行后患者标识替换为不可逆代号、原始录入内容清除，案例、报告、提交记录与处置审计保留。相同申请号重复提交返回首次结果。</p>
+<input id="pvKey" placeholder="申请号 request_key(工单号,勿含患者信息)"><input id="pvRef" placeholder="患者标识 patient_ref"><input id="pvReason" placeholder="申请原因">
+<button onclick="pvCreate()">登记处置单</button><button onclick="pvList()">刷新列表</button>
+<pre id="pvOut"></pre><div id="pvList"></div></section>
+<script>
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function hdr(){return {'X-User-Id':user.value,'X-Role':role.value,'Content-Type':'application/json'}}
+async function load(){let r=await fetch('/api/state',{headers:hdr()});out.textContent=JSON.stringify(await r.json(),null,2)}
+async function pvCreate(){let r=await fetch('/api/privacy-requests',{method:'POST',headers:hdr(),body:JSON.stringify({request_key:pvKey.value,patient_ref:pvRef.value,reason:pvReason.value})});pvOut.textContent=JSON.stringify(await r.json(),null,2);pvList()}
+async function pvExecute(id){let r=await fetch('/api/privacy-requests/'+id+'/execute',{method:'POST',headers:hdr(),body:'{}'});pvOut.textContent=JSON.stringify(await r.json(),null,2);pvList()}
+async function pvList(){let r=await fetch('/api/privacy-requests',{headers:hdr()});let d=await r.json();
+if(!d.requests){pvList.innerHTML=esc(JSON.stringify(d));return}
+let rows=d.requests.map(q=>{let tag=q.status==='executed'?'<span class="tag executed">已脱敏</span>':'<span class="tag pending">待处理</span>';
+let who=q.status==='executed'?('代号 '+esc(q.pseudonym)):esc(q.patient_ref);
+let block=q.blocked_reasons.length?'<span class="blocked">'+q.blocked_reasons.map(esc).join('<br>')+'</span>':'—';
+let cases=q.cases.map(c=>esc(c.case_no)).join('<br>');
+let act=q.status==='pending'?('<button onclick="pvExecute('+q.id+')">执行脱敏</button>'):('执行人 '+esc(q.executed_by)+'<br>'+esc(q.executed_at));
+return '<tr><td>#'+q.id+'<br>'+esc(q.request_key)+'</td><td>'+tag+'</td><td>'+who+'</td><td>'+cases+'</td><td>'+block+'</td><td>'+act+'</td></tr>'}).join('');
+pvList.innerHTML='<table><tr><th>处置单</th><th>状态</th><th>患者/代号</th><th>同患者案例</th><th>阻塞原因</th><th>操作</th></tr>'+rows+'</table>'}
+load();pvList()
+</script>

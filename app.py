@@ -13,16 +13,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import privacy_rules
+
 PORT = 8201
 ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(self, status: int, code: str, message: str, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.details = details or {}
 
 
 def utcnow() -> datetime:
@@ -148,6 +151,29 @@ class Repository:
                 action TEXT NOT NULL,
                 detail_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS privacy_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_key TEXT NOT NULL UNIQUE,
+                patient_ref TEXT NOT NULL,
+                pseudonym TEXT,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                blocked_reasons_json TEXT NOT NULL DEFAULT '[]',
+                result_json TEXT,
+                requested_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                executed_by TEXT,
+                executed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS privacy_request_cases (
+                request_id INTEGER NOT NULL REFERENCES privacy_requests(id),
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                UNIQUE(request_id, case_id)
+            );
+            CREATE TABLE IF NOT EXISTS privacy_meta (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             """
         )
@@ -394,6 +420,182 @@ class PharmacovigilanceService:
                 Repository.audit(conn, row["case_id"], actor, role, "report_overdue_escalated", {"report_id": row["id"], "country": row["country"]})
         return {"escalated": len(rows)}
 
+    PRIVACY_READ_ROLES = {"medical_reviewer", "global_admin"}
+
+    @staticmethod
+    def _require_privacy_read(role: str) -> None:
+        if role not in PharmacovigilanceService.PRIVACY_READ_ROLES:
+            raise ApiError(403, "privacy_forbidden", "当前角色不能查看隐私处置单")
+
+    @staticmethod
+    def _require_privacy_write(role: str) -> None:
+        if role != "global_admin":
+            raise ApiError(403, "privacy_forbidden", "只有全局管理员可以登记和执行隐私处置单")
+
+    def _privacy_key(self, conn: sqlite3.Connection) -> str:
+        row = conn.execute("SELECT value FROM privacy_meta WHERE name=?", (privacy_rules.KEY_NAME,)).fetchone()
+        if row:
+            return row["value"]
+        key = privacy_rules.new_key()
+        conn.execute("INSERT INTO privacy_meta(name,value) VALUES(?,?)", (privacy_rules.KEY_NAME, key))
+        return key
+
+    @staticmethod
+    def _open_reports(conn: sqlite3.Connection, case_ids: list[int]) -> list[dict[str, Any]]:
+        if not case_ids:
+            return []
+        marks = ",".join("?" for _ in case_ids)
+        return [dict(r) for r in conn.execute(
+            f"""SELECT r.id AS report_id, r.case_id, c.case_no, r.country, r.status, r.due_at
+                FROM reports r JOIN cases c ON c.id=r.case_id
+                WHERE r.status!='submitted' AND r.case_id IN ({marks}) ORDER BY r.id""",
+            case_ids,
+        )]
+
+    def _privacy_view(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        case_ids = [r["case_id"] for r in conn.execute(
+            "SELECT case_id FROM privacy_request_cases WHERE request_id=? ORDER BY case_id", (row["id"],))]
+        cases = []
+        if case_ids:
+            marks = ",".join("?" for _ in case_ids)
+            cases = [dict(r) for r in conn.execute(
+                f"SELECT id,case_no,region,status FROM cases WHERE id IN ({marks}) ORDER BY id", case_ids)]
+        pending = row["status"] == privacy_rules.STATUS_PENDING
+        open_reports = self._open_reports(conn, case_ids) if pending else []
+        reasons = privacy_rules.blocker_reasons(open_reports)
+        return {
+            "id": row["id"],
+            "request_key": row["request_key"],
+            "status": row["status"],
+            "status_label": privacy_rules.STATUS_LABELS[row["status"]],
+            "reason": row["reason"],
+            "patient_ref": row["patient_ref"] if pending else None,
+            "pseudonym": row["pseudonym"],
+            "cases": cases,
+            "open_reports": open_reports,
+            "blocked": bool(reasons),
+            "blocked_reasons": reasons,
+            "requested_by": row["requested_by"],
+            "created_at": row["created_at"],
+            "executed_by": row["executed_by"],
+            "executed_at": row["executed_at"],
+        }
+
+    def create_privacy_request(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        self._require_privacy_write(role)
+        request_key = str(body.get("request_key", "")).strip()
+        patient_ref = str(body.get("patient_ref", "")).strip()
+        reason = str(body.get("reason", "")).strip()
+        if not request_key or not patient_ref or not reason:
+            raise ApiError(400, "missing_fields", "request_key、patient_ref 和 reason 必填")
+        with self.repo.tx() as conn:
+            existing = conn.execute("SELECT * FROM privacy_requests WHERE request_key=?", (request_key,)).fetchone()
+            if existing:
+                return {"request": self._privacy_view(conn, existing), "idempotent": True}
+            cases = [dict(r) for r in conn.execute(
+                "SELECT id FROM cases WHERE patient_ref=? ORDER BY id", (patient_ref,))]
+            if not cases:
+                raise ApiError(404, "no_patient_cases", "未找到该患者标识的案例")
+            now = iso()
+            cur = conn.execute(
+                "INSERT INTO privacy_requests(request_key,patient_ref,reason,status,requested_by,created_at) VALUES(?,?,?,?,?,?)",
+                (request_key, patient_ref, reason, privacy_rules.STATUS_PENDING, actor, now),
+            )
+            request_id = cur.lastrowid
+            case_ids = [case["id"] for case in cases]
+            for case_id in case_ids:
+                conn.execute("INSERT INTO privacy_request_cases(request_id,case_id) VALUES(?,?)", (request_id, case_id))
+            reasons = privacy_rules.blocker_reasons(self._open_reports(conn, case_ids))
+            conn.execute("UPDATE privacy_requests SET blocked_reasons_json=? WHERE id=?",
+                         (json.dumps(reasons, ensure_ascii=False), request_id))
+            Repository.audit(conn, None, actor, role, "privacy_request_created",
+                             {"request_id": request_id, "request_key": request_key, "case_ids": case_ids})
+            row = conn.execute("SELECT * FROM privacy_requests WHERE id=?", (request_id,)).fetchone()
+            return {"request": self._privacy_view(conn, row), "idempotent": False}
+
+    def get_privacy_request(self, request_id: int, role: str) -> dict[str, Any]:
+        self._require_privacy_read(role)
+        row = self.repo.conn.execute("SELECT * FROM privacy_requests WHERE id=?", (request_id,)).fetchone()
+        if not row:
+            raise ApiError(404, "privacy_request_not_found", "隐私处置单不存在")
+        return self._privacy_view(self.repo.conn, row)
+
+    def list_privacy_requests(self, role: str) -> list[dict[str, Any]]:
+        self._require_privacy_read(role)
+        return [self._privacy_view(self.repo.conn, row) for row in
+                self.repo.conn.execute("SELECT * FROM privacy_requests ORDER BY id DESC")]
+
+    def execute_privacy_request(self, request_id: int, actor: str, role: str) -> dict[str, Any]:
+        self._require_privacy_write(role)
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM privacy_requests WHERE id=?", (request_id,)).fetchone()
+            if not row:
+                raise ApiError(404, "privacy_request_not_found", "隐私处置单不存在")
+            if row["status"] == privacy_rules.STATUS_EXECUTED:
+                return {"request": json.loads(row["result_json"]), "idempotent": True}
+            patient_ref = row["patient_ref"]
+            for case in conn.execute("SELECT id FROM cases WHERE patient_ref=?", (patient_ref,)):
+                conn.execute("INSERT OR IGNORE INTO privacy_request_cases(request_id,case_id) VALUES(?,?)",
+                             (request_id, case["id"]))
+            case_ids = [r["case_id"] for r in conn.execute(
+                "SELECT case_id FROM privacy_request_cases WHERE request_id=? ORDER BY case_id", (request_id,))]
+            open_reports = self._open_reports(conn, case_ids)
+            reasons = privacy_rules.blocker_reasons(open_reports)
+            if reasons:
+                conn.execute("UPDATE privacy_requests SET blocked_reasons_json=? WHERE id=?",
+                             (json.dumps(reasons, ensure_ascii=False), request_id))
+                Repository.audit(conn, None, actor, role, "privacy_execution_blocked",
+                                 {"request_id": request_id, "request_key": row["request_key"],
+                                  "open_report_ids": [r["report_id"] for r in open_reports]})
+                raise ApiError(409, "privacy_blocked", "存在未结清的监管报告，申请保留在待处理",
+                               {"blocked_reasons": reasons, "open_reports": open_reports})
+            pseudonym = privacy_rules.pseudonym_for(self._privacy_key(conn), patient_ref)
+            marks = ",".join("?" for _ in case_ids)
+            now = iso()
+            conn.execute(f"UPDATE cases SET patient_ref=?,updated_at=? WHERE id IN ({marks})", [pseudonym, now, *case_ids])
+            intake_count = conn.execute(f"SELECT COUNT(*) FROM intakes WHERE case_id IN ({marks})", case_ids).fetchone()[0]
+            followup_count = conn.execute(f"SELECT COUNT(*) FROM followups WHERE case_id IN ({marks})", case_ids).fetchone()[0]
+            scrubbed_payload = json.dumps({"scrubbed": True, "privacy_request_id": request_id}, ensure_ascii=False)
+            conn.execute(f"UPDATE intakes SET payload_json=? WHERE case_id IN ({marks})", [scrubbed_payload, *case_ids])
+            conn.execute(f"UPDATE followups SET content=? WHERE case_id IN ({marks})",
+                         [privacy_rules.CLEARED_MARKER, *case_ids])
+            for case_id in case_ids:
+                Repository.audit(conn, case_id, actor, role, "privacy_anonymized",
+                                 {"request_id": request_id, "pseudonym": pseudonym})
+            Repository.audit(conn, None, actor, role, "privacy_request_executed",
+                             {"request_id": request_id, "request_key": row["request_key"], "pseudonym": pseudonym,
+                              "case_count": len(case_ids), "intakes_scrubbed": intake_count,
+                              "followups_scrubbed": followup_count})
+            case_rows = [dict(r) for r in conn.execute(
+                f"SELECT id,case_no,region,status FROM cases WHERE id IN ({marks}) ORDER BY id", case_ids)]
+            result = {
+                "id": request_id,
+                "request_key": row["request_key"],
+                "status": privacy_rules.STATUS_EXECUTED,
+                "status_label": privacy_rules.STATUS_LABELS[privacy_rules.STATUS_EXECUTED],
+                "reason": row["reason"],
+                "patient_ref": None,
+                "pseudonym": pseudonym,
+                "cases": case_rows,
+                "open_reports": [],
+                "blocked": False,
+                "blocked_reasons": [],
+                "case_count": len(case_ids),
+                "intakes_scrubbed": intake_count,
+                "followups_scrubbed": followup_count,
+                "requested_by": row["requested_by"],
+                "created_at": row["created_at"],
+                "executed_by": actor,
+                "executed_at": now,
+            }
+            conn.execute(
+                """UPDATE privacy_requests SET status=?,pseudonym=?,patient_ref=?,blocked_reasons_json='[]',
+                   result_json=?,executed_by=?,executed_at=? WHERE id=?""",
+                (privacy_rules.STATUS_EXECUTED, pseudonym, pseudonym,
+                 json.dumps(result, ensure_ascii=False, sort_keys=True), actor, now, request_id),
+            )
+            return {"request": result, "idempotent": False}
+
     def state(self, role: str, region: str) -> dict[str, Any]:
         cases = self.list_cases(role, region, {})
         return {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
@@ -437,9 +639,13 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/privacy-requests":
+            return 200, {"requests": self.service.list_privacy_requests(role)}
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
+        if len(parts) == 3 and parts[:2] == ["api", "privacy-requests"] and parts[2].isdigit():
+            return 200, {"request": self.service.get_privacy_request(int(parts[2]), role)}
         raise ApiError(404, "not_found", "接口不存在")
 
     def _dispatch_post(self, path: str, body: dict[str, Any]) -> Any:
@@ -448,7 +654,11 @@ class Handler(BaseHTTPRequestHandler):
             return 201, self.service.create_case(actor, role, region, body)
         if path == "/api/escalate-overdue":
             return 200, self.service.escalate_overdue(actor, role, region)
+        if path == "/api/privacy-requests":
+            return 201, self.service.create_privacy_request(actor, role, body)
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 4 and parts[:2] == ["api", "privacy-requests"] and parts[2].isdigit() and parts[3] == "execute":
+            return 200, self.service.execute_privacy_request(int(parts[2]), actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             case_id, action = int(parts[2]), parts[3]
             if action == "followups":
@@ -480,7 +690,7 @@ class Handler(BaseHTTPRequestHandler):
                 status, payload = self._dispatch_post(parsed.path, self._body())
             json_response(self, status, payload)
         except ApiError as exc:
-            json_response(self, exc.status, {"error": exc.code, "message": exc.message})
+            json_response(self, exc.status, {"error": exc.code, "message": exc.message, **exc.details})
         except Exception as exc:
             print(f"unhandled error: {exc!r}")
             json_response(self, 500, {"error": "internal_error", "message": str(exc)})
