@@ -6,167 +6,31 @@ import argparse
 import json
 import os
 import sqlite3
-from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from errors import ApiError
+from repository import Repository, iso, parse_time, utcnow
+from rules import (
+    ROLES,
+    can_access,
+    irreversible_pseudonym,
+    patient_key_hash,
+    privacy_order,
+    redacted_intake_payload,
+    report_deadline,
+)
+
 PORT = 8201
-ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
 
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message)
-        self.status = status
-        self.code = code
-        self.message = message
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    current = value or utcnow()
-    return current.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def parse_time(value: str | None, default: datetime | None = None) -> datetime:
-    if not value:
-        if default is None:
-            raise ApiError(400, "missing_time", "必须提供 ISO 8601 时间")
-        return default
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def report_deadline(received_at: datetime, serious: bool, fatal: bool) -> datetime:
-    if serious:
-        return received_at + timedelta(days=7 if fatal else 15)
-    return received_at + timedelta(days=90)
-
-
-class Repository:
-    def __init__(self, db_path: str | Path):
-        self.db_path = str(db_path)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.init_schema()
-
-    @contextmanager
-    def tx(self):
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.conn
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
-
-    def init_schema(self) -> None:
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS cases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_no TEXT NOT NULL UNIQUE,
-                patient_ref TEXT NOT NULL,
-                region TEXT NOT NULL,
-                product TEXT NOT NULL,
-                event_term TEXT NOT NULL,
-                onset_at TEXT,
-                received_at TEXT NOT NULL,
-                serious INTEGER NOT NULL DEFAULT 0,
-                fatal INTEGER NOT NULL DEFAULT 0,
-                causality TEXT,
-                report_due_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',
-                revision INTEGER NOT NULL DEFAULT 1,
-                merged_into INTEGER REFERENCES cases(id),
-                created_by TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS intakes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_id INTEGER REFERENCES cases(id),
-                source TEXT NOT NULL,
-                dedupe_key TEXT NOT NULL UNIQUE,
-                payload_json TEXT NOT NULL,
-                received_at TEXT NOT NULL,
-                created_by TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS followups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_id INTEGER NOT NULL REFERENCES cases(id),
-                content TEXT NOT NULL,
-                source TEXT NOT NULL,
-                received_at TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                created_by TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(case_id, revision)
-            );
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_id INTEGER NOT NULL REFERENCES cases(id),
-                country TEXT NOT NULL,
-                due_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                submitted_at TEXT,
-                submitted_by TEXT,
-                late INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(case_id, country)
-            );
-            CREATE TABLE IF NOT EXISTS medical_reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_id INTEGER NOT NULL REFERENCES cases(id),
-                case_revision INTEGER NOT NULL,
-                serious INTEGER NOT NULL,
-                fatal INTEGER NOT NULL,
-                causality TEXT NOT NULL,
-                rationale TEXT NOT NULL,
-                reviewer TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(case_id, case_revision)
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_id INTEGER,
-                actor TEXT NOT NULL,
-                role TEXT NOT NULL,
-                action TEXT NOT NULL,
-                detail_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-
-    @staticmethod
-    def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
-        conn.execute(
-            "INSERT INTO audit_log(case_id,actor,role,action,detail_json,created_at) VALUES(?,?,?,?,?,?)",
-            (case_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()),
-        )
-
-    @staticmethod
-    def row(row: sqlite3.Row | None) -> dict[str, Any] | None:
-        return dict(row) if row is not None else None
 
 
 class PharmacovigilanceService:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, privacy_salt: str | None = None):
         self.repo = Repository(db_path)
+        self.privacy_salt = privacy_salt or os.environ.get("PV_PRIVACY_SALT", "development-privacy-salt")
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -179,15 +43,8 @@ class PharmacovigilanceService:
             raise ApiError(401, "region_required", "该角色必须提供 X-Region")
         return actor, role, region
 
-    @staticmethod
-    def can_access(case: dict[str, Any], role: str, region: str) -> bool:
-        return role in {"medical_reviewer", "global_admin"} or case["region"] == region
-
     def _case(self, conn: sqlite3.Connection, case_id: int) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
-        if not row:
-            raise ApiError(404, "case_not_found", "案例不存在")
-        return row
+        return self.repo.get_case(conn, case_id)
 
     def create_case(self, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         required = ("patient_ref", "region", "product", "event_term", "source", "dedupe_key")
@@ -233,7 +90,7 @@ class PharmacovigilanceService:
 
     def get_case(self, case_id: int, role: str, region: str) -> dict[str, Any]:
         case = self._case(self.repo.conn, case_id)
-        if not self.can_access(case, role, region):
+        if not can_access(case, role, region):
             raise ApiError(403, "case_forbidden", "无权查看该区域案例")
         conn = self.repo.conn
         return {
@@ -267,7 +124,7 @@ class PharmacovigilanceService:
             raise ApiError(400, "revision_required", "expected_revision 必须是整数")
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
-            if not self.can_access(case, role, region) or role in {"medical_reviewer"}:
+            if not can_access(case, role, region) or role in {"medical_reviewer"}:
                 raise ApiError(403, "followup_forbidden", "当前角色不能提交随访")
             if case["status"] == "merged":
                 raise ApiError(409, "case_merged", "已合并案例不能再更新")
@@ -330,7 +187,7 @@ class PharmacovigilanceService:
             raise ApiError(400, "country_required", "country 必填")
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
-            if not self.can_access(case, role, region):
+            if not can_access(case, role, region):
                 raise ApiError(403, "region_forbidden", "不能为本区域之外案例生成报告")
             due = report_deadline(parse_time(case["received_at"]), bool(case["serious"]), bool(case["fatal"]))
             try:
@@ -347,7 +204,7 @@ class PharmacovigilanceService:
             row = conn.execute("SELECT r.*,c.region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
             if not row:
                 raise ApiError(404, "report_not_found", "报告不存在")
-            if not self.can_access(dict(row), role, region):
+            if not can_access(dict(row), role, region):
                 raise ApiError(403, "region_forbidden", "无权提交其他区域报告")
             if row["status"] == "submitted":
                 return {"report": dict(row), "idempotent": True}
@@ -394,6 +251,222 @@ class PharmacovigilanceService:
                 Repository.audit(conn, row["case_id"], actor, role, "report_overdue_escalated", {"report_id": row["id"], "country": row["country"]})
         return {"escalated": len(rows)}
 
+    @staticmethod
+    def _decode(value: str | None, fallback: Any) -> Any:
+        return json.loads(value) if value else fallback
+
+    def _current_order(self, conn: sqlite3.Connection, patient_ref: str) -> dict[str, Any]:
+        cases = self.repo.cases_for_patient(conn, patient_ref)
+        case_ids = [case["id"] for case in cases]
+        reports = self.repo.unfinished_reports_for_cases(conn, case_ids)
+        submitted_case_ids = self.repo.submitted_case_ids(conn, case_ids)
+        return privacy_order(cases, reports, submitted_case_ids, patient_ref)
+
+    @staticmethod
+    def _final_order(order: dict[str, Any], pseudonym: str) -> dict[str, Any]:
+        final_order = {key: value for key, value in order.items() if key != "patient_ref"}
+        final_order["pseudonym"] = pseudonym
+        return final_order
+
+    def _serialize_privacy_request(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        initial_order = self._decode(row["order_json"], {})
+        result = self._decode(row["result_json"], None)
+        if row["status"] == "anonymized":
+            initial_order = {key: value for key, value in initial_order.items() if key != "patient_ref"}
+            if row["pseudonym"]:
+                initial_order.setdefault("pseudonym", row["pseudonym"])
+        request = {
+            "id": row["id"],
+            "request_no": row["request_no"],
+            "status": row["status"],
+            "pseudonym": row["pseudonym"],
+            "requested_by": row["requested_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "anonymized_at": row["anonymized_at"],
+            "initial_order": initial_order,
+            "result": result,
+            "events": [
+                {
+                    "id": event["id"],
+                    "actor": event["actor"],
+                    "action": event["action"],
+                    "detail": self._decode(event["detail_json"], {}),
+                    "created_at": event["created_at"],
+                }
+                for event in self.repo.privacy_events(conn, row["id"])
+            ],
+        }
+        if row["status"] == "pending":
+            request["patient_ref"] = row["patient_ref"]
+            current_order = self._current_order(conn, row["patient_ref"])
+            request["current_order"] = current_order
+            request["blocking_reasons"] = current_order["blocking_reasons"]
+            request["ready"] = current_order["ready"]
+        else:
+            request["blocking_reasons"] = []
+            request["ready"] = True
+        return request
+
+    @staticmethod
+    def _privacy_payload(request_row: dict[str, Any], order: dict[str, Any], idempotent: bool) -> dict[str, Any]:
+        return {"request": request_row, "order": order, "idempotent": idempotent}
+
+    def list_privacy_requests(self, role: str) -> list[dict[str, Any]]:
+        if role != "global_admin":
+            raise ApiError(403, "privacy_forbidden", "只有全局管理员可以查看隐私处置单")
+        with self.repo.tx() as conn:
+            return [self._serialize_privacy_request(conn, row) for row in self.repo.list_privacy_requests(conn)]
+
+    def get_privacy_request(self, request_id: int, role: str) -> dict[str, Any]:
+        if role != "global_admin":
+            raise ApiError(403, "privacy_forbidden", "只有全局管理员可以查看隐私处置单")
+        with self.repo.tx() as conn:
+            row = self.repo.privacy_request_by_id(conn, request_id)
+            if not row:
+                raise ApiError(404, "privacy_request_not_found", "隐私处置单不存在")
+            request = self._serialize_privacy_request(conn, row)
+        order = request["result"] if request["status"] == "anonymized" else request["current_order"]
+        return self._privacy_payload(request, order, False)
+
+    def create_privacy_request(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "global_admin":
+            raise ApiError(403, "privacy_forbidden", "只有全局管理员可以受理患者匿名化申请")
+        patient_ref = str(body.get("patient_ref", "")).strip()
+        if not patient_ref:
+            raise ApiError(400, "patient_ref_required", "patient_ref 必填")
+        now = iso()
+        patient_key = patient_key_hash(patient_ref, self.privacy_salt)
+        with self.repo.tx() as conn:
+            existing = self.repo.privacy_request_by_patient(conn, patient_key)
+            if existing:
+                request = self._serialize_privacy_request(conn, existing)
+                return self._privacy_payload(request, request["initial_order"], True)
+
+            cases = self.repo.cases_for_patient(conn, patient_ref)
+            if not cases:
+                raise ApiError(404, "patient_cases_not_found", "未找到该患者的案例")
+            case_ids = [case["id"] for case in cases]
+            reports = self.repo.unfinished_reports_for_cases(conn, case_ids)
+            submitted_case_ids = self.repo.submitted_case_ids(conn, case_ids)
+            initial_order = privacy_order(cases, reports, submitted_case_ids, patient_ref)
+            count = conn.execute("SELECT COUNT(*) FROM privacy_requests").fetchone()[0] + 1
+            request_no = f"PRV-{utcnow().strftime('%Y%m%d')}-{count:06d}"
+
+            if initial_order["blocking_reasons"]:
+                request_id = self.repo.insert_privacy_request(conn, {
+                    "request_no": request_no,
+                    "patient_ref": patient_ref,
+                    "patient_key_hash": patient_key,
+                    "pseudonym": None,
+                    "status": "pending",
+                    "order_json": json.dumps(initial_order, ensure_ascii=False, sort_keys=True),
+                    "result_json": None,
+                    "requested_by": actor,
+                    "created_at": now,
+                    "updated_at": now,
+                    "anonymized_at": None,
+                })
+                self.repo.add_privacy_event(
+                    conn, request_id, actor, "privacy_request_blocked",
+                    {"blocking_reasons": initial_order["blocking_reasons"]},
+                )
+                row = self.repo.privacy_request_by_id(conn, request_id)
+                request = self._serialize_privacy_request(conn, row)
+                return self._privacy_payload(request, request["current_order"], False)
+
+            pseudonym = irreversible_pseudonym()
+            case_ids = self.repo.anonymize_patient_records(
+                conn, patient_ref, pseudonym, redacted_intake_payload(), now
+            )
+            result = self._final_order(initial_order, pseudonym)
+            result["redacted_at"] = now
+            request_id = self.repo.insert_privacy_request(conn, {
+                "request_no": request_no,
+                "patient_ref": None,
+                "patient_key_hash": patient_key,
+                "pseudonym": pseudonym,
+                "status": "anonymized",
+                "order_json": json.dumps(result, ensure_ascii=False, sort_keys=True),
+                "result_json": json.dumps(result, ensure_ascii=False, sort_keys=True),
+                "requested_by": actor,
+                "created_at": now,
+                "updated_at": now,
+                "anonymized_at": now,
+            })
+            self.repo.add_privacy_event(
+                conn, request_id, actor, "privacy_anonymized",
+                {"pseudonym": pseudonym, "case_ids": case_ids},
+            )
+            for case_id in case_ids:
+                Repository.audit(conn, case_id, actor, role, "patient_anonymized",
+                                 {"pseudonym": pseudonym, "privacy_request_id": request_id,
+                                  "cleared_fields": ["intakes.payload_json", "intakes.dedupe_key",
+                                                     "followups.content", "medical_reviews.rationale"]})
+            request = self._serialize_privacy_request(conn, self.repo.privacy_request_by_id(conn, request_id))
+            return self._privacy_payload(request, result, False)
+
+    def execute_privacy_request(self, request_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role != "global_admin":
+            raise ApiError(403, "privacy_forbidden", "只有全局管理员可以执行隐私处置")
+        now = iso()
+        with self.repo.tx() as conn:
+            row = self.repo.privacy_request_by_id(conn, request_id)
+            if not row:
+                raise ApiError(404, "privacy_request_not_found", "隐私处置单不存在")
+            if row["status"] == "anonymized":
+                request = self._serialize_privacy_request(conn, row)
+                return {**self._privacy_payload(request, request["result"], True), "executed": False}
+
+            patient_ref = row["patient_ref"]
+            current_order = self._current_order(conn, patient_ref)
+            if current_order["blocking_reasons"]:
+                self.repo.add_privacy_event(
+                    conn, request_id, actor, "privacy_execution_blocked",
+                    {"blocking_reasons": current_order["blocking_reasons"]},
+                )
+                self.repo.update_privacy_request(conn, request_id, {
+                    "patient_ref": patient_ref,
+                    "pseudonym": None,
+                    "status": "pending",
+                    "order_json": row["order_json"],
+                    "result_json": None,
+                    "updated_at": now,
+                    "anonymized_at": None,
+                })
+                request = self._serialize_privacy_request(conn, self.repo.privacy_request_by_id(conn, request_id))
+                return {**self._privacy_payload(request, request["current_order"], False), "executed": False}
+
+            pseudonym = irreversible_pseudonym()
+            case_ids = self.repo.anonymize_patient_records(
+                conn, patient_ref, pseudonym, redacted_intake_payload(), now
+            )
+            result = self._final_order(current_order, pseudonym)
+            result["redacted_at"] = now
+            initial_order = self._decode(row["order_json"], {})
+            initial_result = self._final_order(initial_order, pseudonym)
+            initial_result["redacted_at"] = now
+            self.repo.update_privacy_request(conn, request_id, {
+                "patient_ref": None,
+                "pseudonym": pseudonym,
+                "status": "anonymized",
+                "order_json": json.dumps(initial_result, ensure_ascii=False, sort_keys=True),
+                "result_json": json.dumps(result, ensure_ascii=False, sort_keys=True),
+                "updated_at": now,
+                "anonymized_at": now,
+            })
+            self.repo.add_privacy_event(
+                conn, request_id, actor, "privacy_anonymized",
+                {"pseudonym": pseudonym, "case_ids": case_ids},
+            )
+            for case_id in case_ids:
+                Repository.audit(conn, case_id, actor, role, "patient_anonymized",
+                                 {"pseudonym": pseudonym, "privacy_request_id": request_id,
+                                  "cleared_fields": ["intakes.payload_json", "intakes.dedupe_key",
+                                                     "followups.content", "medical_reviews.rationale"]})
+            request = self._serialize_privacy_request(conn, self.repo.privacy_request_by_id(conn, request_id))
+            return {**self._privacy_payload(request, result, False), "executed": True}
+
     def state(self, role: str, region: str) -> dict[str, Any]:
         cases = self.list_cases(role, region, {})
         return {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
@@ -437,7 +510,11 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/privacy-requests":
+            return 200, {"requests": self.service.list_privacy_requests(role)}
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[:2] == ["api", "privacy-requests"] and parts[2].isdigit():
+            return 200, self.service.get_privacy_request(int(parts[2]), role)
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
         raise ApiError(404, "not_found", "接口不存在")
@@ -448,7 +525,12 @@ class Handler(BaseHTTPRequestHandler):
             return 201, self.service.create_case(actor, role, region, body)
         if path == "/api/escalate-overdue":
             return 200, self.service.escalate_overdue(actor, role, region)
+        if path == "/api/privacy-requests":
+            result = self.service.create_privacy_request(actor, role, body)
+            return (200 if result["idempotent"] else 201), result
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 4 and parts[:2] == ["api", "privacy-requests"] and parts[2].isdigit() and parts[3] == "execute":
+            return 200, self.service.execute_privacy_request(int(parts[2]), actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             case_id, action = int(parts[2]), parts[3]
             if action == "followups":

@@ -12,6 +12,8 @@ python3 app.py --db pharmacovigilance.db
 
 默认监听 `127.0.0.1:8201`。首页为 `http://127.0.0.1:8201/`，健康检查为 `/health`。
 
+患者重复申请匹配使用 HMAC-SHA256，生产环境应通过 `PV_PRIVACY_SALT` 设置部署专属盐值；脱敏代号由密码学安全随机数生成且不可反推。
+
 所有接口使用请求头 `X-User-Id`、`X-Role` 和区域角色必需的 `X-Region`。角色为 `reporter`、`regional_lead`、`medical_reviewer`、`global_admin`。
 
 ## 主要接口
@@ -22,6 +24,9 @@ python3 app.py --db pharmacovigilance.db
 - `POST /api/cases/{id}/medical-review`：医学审核员更新严重性、死亡和关联性。
 - `POST /api/cases/{id}/reports`、`POST /api/reports/{id}/submit`：生成并提交分国家报告。
 - `POST /api/cases/{id}/merge`：全局管理员合并重复案例。
+- `POST /api/privacy-requests`：患者匿名化申请；生成隐私处置单，列出同患者案例、未完成报告和待发监管动作。报告未结清时保持待处理；重放相同申请会返回首次处置单。
+- `GET /api/privacy-requests`、`GET /api/privacy-requests/{id}`：查看待处理、已脱敏状态与阻塞原因。
+- `POST /api/privacy-requests/{id}/execute`：待报告全部提交后执行；执行后患者标识变为不可逆代号，并清除原始录入载荷，但保留案例、报告、提交与处置审计。
 - `POST /api/escalate-overdue`、`GET /api/overdue`：逾期检查与升级。
 
 ## 测试
@@ -29,6 +34,12 @@ python3 app.py --db pharmacovigilance.db
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## 模块边界
+
+- `repository.py`：SQLite 表结构、事务与数据访问。
+- `rules.py`：报告期限、权限、隐私阻塞、不可逆代号和清除规则。
+- `app.py`：JSON/HTTP 接口与服务编排；`static/index.html` 是调用接口的页面。
 
 ## 主要局限
 
